@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Multi-Tenant Verification API — Design</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #6a6a6a;
+    --rule: #e5e5e5;
+    --accent: #2a5d9f;
+    --code-bg: #f6f6f4;
+    --impl-bg: #eaf3ea;
+    --impl-fg: #2c5f2c;
+    --cut-bg: #fbeeea;
+    --cut-fg: #8a3e1f;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: var(--fg);
+    max-width: 760px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    line-height: 1.6;
+    font-size: 16px;
+  }
+  h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+  h2 {
+    font-size: 1.3rem;
+    margin-top: 2.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+  }
+  h3 { font-size: 1.05rem; margin-top: 1.75rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+  pre {
+    background: var(--code-bg);
+    padding: 0.85rem 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  blockquote {
+    margin: 1.25rem 0;
+    padding: 0.5rem 1rem;
+    border-left: 3px solid var(--accent);
+    color: var(--muted);
+    background: #fafafa;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  .tag.impl { background: var(--impl-bg); color: var(--impl-fg); }
+  .tag.cut  { background: var(--cut-bg);  color: var(--cut-fg); }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.5rem 0.65rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { background: #fafafa; font-weight: 600; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.25rem 0; }
+  .small { color: var(--muted); font-size: 0.9rem; }
+  .diagram {
+    background: var(--code-bg);
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    text-align: center;
+  }
+  .diagram svg { max-width: 100%; height: auto; }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 2rem 0; }
+  .toc {
+    background: #fafafa;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.85rem 1.25rem;
+    margin: 1.5rem 0 2rem;
+    font-size: 0.93rem;
+  }
+  .toc ol { margin: 0; padding-left: 1.2rem; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>Multi-Tenant Verification API</h1>
+<p class="subtitle">Design document — Ken Lee · Tofu take-home</p>
+
+<blockquote>
+The interesting requirements in this brief are <strong>tenant isolation</strong>, <strong>fairness across orgs</strong>, <strong>a global 10 req/s ceiling on a downstream provider</strong>, and <strong>surviving a worker crash mid-job</strong>. The CRUD surface is small. I designed against those four, and the implementation focuses on demonstrating each of them concretely.
+</blockquote>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#constraints">Constraints I'm designing against</a></li>
+  <li><a href="#arch">Architecture</a></li>
+  <li><a href="#isolation">Tenant isolation (Postgres RLS)</a></li>
+  <li><a href="#fairness">Fairness: longest-waited org wins</a></li>
+  <li><a href="#ratelimit">Rate limiting via token bucket</a></li>
+  <li><a href="#retries">Retries &amp; backoff</a></li>
+  <li><a href="#crash">Crash recovery</a></li>
+  <li><a href="#data">Data model</a></li>
+  <li><a href="#api">API surface</a></li>
+  <li><a href="#prod">Full production design (bells &amp; whistles)</a></li>
+  <li><a href="#cuts">Vertical slice: implemented vs cut</a></li>
+</ol>
+</div>
+
+<h2 id="constraints">1. Constraints I'm designing against</h2>
+
+<ul>
+  <li><strong>Two orgs must never see each other's data.</strong> Stronger than "always pass <code>org_id</code> in queries" — that's convention. I want it enforced at the database boundary.</li>
+  <li><strong>10 req/s global ceiling on the downstream provider.</strong> Not per-org, not per-worker. This shapes the dispatcher.</li>
+  <li><strong>One noisy org cannot starve everyone else.</strong> 10,000 jobs from Org A should not block Org B's single job.</li>
+  <li><strong>Results survive a worker crash mid-job.</strong> "In-progress" cannot be a state that requires the worker to recover it.</li>
+  <li><strong>Transient 5xx from the provider (~20%) is normal.</strong> Retries with backoff, capped.</li>
+  <li><strong>Low absolute throughput.</strong> 10 req/s is ~864k jobs/day at the ceiling. This is not a system that needs Kafka, Kubernetes, or a fleet of workers — and pretending otherwise would be the wrong signal.</li>
+</ul>
+
+<h2 id="arch">2. Architecture</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram">
+  <style>
+    .box { fill: #fff; stroke: #2a5d9f; stroke-width: 1.5; }
+    .lbl { font: 13px -apple-system, sans-serif; fill: #1a1a1a; }
+    .sub { font: 11px -apple-system, sans-serif; fill: #6a6a6a; }
+    .arrow { stroke: #6a6a6a; stroke-width: 1.2; fill: none; marker-end: url(#a); }
+    .dashed { stroke-dasharray: 4 4; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6a6a6a"/>
+    </marker>
+  </defs>
+
+  <!-- Client -->
+  <rect class="box" x="20" y="130" width="110" height="60" rx="4"/>
+  <text class="lbl" x="75" y="160" text-anchor="middle">Client</text>
+  <text class="sub" x="75" y="175" text-anchor="middle">X-API-Key</text>
+
+  <!-- API -->
+  <rect class="box" x="190" y="130" width="130" height="60" rx="4"/>
+  <text class="lbl" x="255" y="160" text-anchor="middle">api (FastAPI)</text>
+  <text class="sub" x="255" y="175" text-anchor="middle">RLS-scoped session</text>
+
+  <!-- Postgres -->
+  <rect class="box" x="380" y="40" width="160" height="80" rx="4"/>
+  <text class="lbl" x="460" y="70" text-anchor="middle">postgres</text>
+  <text class="sub" x="460" y="88" text-anchor="middle">verification_jobs</text>
+  <text class="sub" x="460" y="103" text-anchor="middle">RLS policies on org_id</text>
+
+  <!-- Worker -->
+  <rect class="box" x="380" y="200" width="160" height="80" rx="4"/>
+  <text class="lbl" x="460" y="230" text-anchor="middle">worker</text>
+  <text class="sub" x="460" y="248" text-anchor="middle">dispatcher + 10 r/s bucket</text>
+  <text class="sub" x="460" y="263" text-anchor="middle">reclaim loop (1 Hz)</text>
+
+  <!-- Enrichment -->
+  <rect class="box" x="590" y="130" width="115" height="60" rx="4"/>
+  <text class="lbl" x="647" y="155" text-anchor="middle">enrichment</text>
+  <text class="sub" x="647" y="170" text-anchor="middle">flaky · 1–5s</text>
+  <text class="sub" x="647" y="183" text-anchor="middle">10 r/s · 20% 5xx</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M130,160 L188,160"/>
+  <path class="arrow" d="M320,150 L378,90"/>
+  <path class="arrow" d="M460,200 L460,122"/>
+  <path class="arrow" d="M540,240 L590,180"/>
+</svg>
+</div>
+
+<p>Four services in <code>docker compose</code>:</p>
+
+<ul>
+  <li><strong><code>api</code></strong> — FastAPI. Three endpoints. Each request opens a transaction, sets <code>app.current_org_id</code>, and every query is automatically scoped by Postgres RLS.</li>
+  <li><strong><code>worker</code></strong> — A single Python process running two asyncio loops: the dispatcher (claims and fires jobs) and the reclaimer (rescues stuck rows). Uses a privileged DB role that bypasses RLS, because scheduling needs cross-org visibility.</li>
+  <li><strong><code>enrichment</code></strong> — A separate FastAPI service that simulates the third-party provider. Sleeps 1–5s, returns 5xx ~20% of the time, and <em>enforces</em> the 10 req/s ceiling itself (returns 429 if exceeded). I made enforcement real because that's what lets a reviewer verify we're respecting the limit rather than taking my word for it.</li>
+  <li><strong><code>postgres</code></strong> — Single instance, RLS-enabled, schema and seed data loaded from <code>init.sql</code> on boot.</li>
+</ul>
+
+<h2 id="isolation">3. Tenant isolation (Postgres RLS)</h2>
+
+<p>I'm using Postgres Row-Level Security as the primary isolation mechanism. The query layer is the wrong place to enforce tenancy: every new query is a chance to forget the <code>WHERE org_id = ?</code> clause, and unit tests can't prove the absence of that bug. RLS pushes the guarantee down to the database, where every <code>SELECT</code>/<code>UPDATE</code>/<code>DELETE</code> is filtered by policy regardless of what the application code does.</p>
+
+<p>The mechanism:</p>
+
+<pre><code>ALTER TABLE verification_jobs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON verification_jobs
+  USING (org_id = current_setting('app.current_org_id')::uuid);
+</code></pre>
+
+<p>Per request, the API does:</p>
+
+<pre><code>BEGIN;
+SET LOCAL app.current_org_id = '&lt;org_uuid_from_api_key&gt;';
+-- all queries in this transaction are now scoped
+COMMIT;
+</code></pre>
+
+<p><strong>The auth bootstrap.</strong> The API-key→org lookup can't itself be RLS-scoped, because we don't know the org yet. I keep credentials in a separate <code>api_keys</code> table, which is treated as an <em>auth table</em>, not a tenant data table — it has no RLS. The lookup is by <code>key_hash</code>, which is itself the credential: knowing the hash <em>is</em> the authorization, so there's no cross-tenant risk to enforce at the row level. The flow is linear: hash the header → <code>SELECT org_id FROM api_keys WHERE key_hash = ?</code> → <code>SET LOCAL app.current_org_id = &lt;org_id&gt;</code> → enter the handler with full RLS scoping. No sentinel, no conditional policy. Separating credentials from tenant data also makes key rotation, expiry, and scopes easy to add later (one org → many keys).</p>
+
+<p><strong>The worker exemption.</strong> The dispatcher must see jobs across all orgs to make fairness decisions. It connects as a separate Postgres role with <code>BYPASSRLS</code> granted. The privilege boundary is enforced by the database, not the application.</p>
+
+<h3>Making it hard to misuse (defense in depth)</h3>
+
+<p>RLS only helps if you can't accidentally route around it. Four layers, strongest to most operational:</p>
+
+<ol>
+  <li><strong>Two Postgres roles, two DSNs.</strong> <code>app_api</code> (no <code>BYPASSRLS</code>, scoped grants) and <code>app_worker</code> (<code>BYPASSRLS</code>). Each container is started with only its own DSN injected as an env var — there's no in-codebase switch between them. Escalating from API code to worker privilege would require credentials the API container doesn't have.</li>
+  <li><strong>Fail-closed RLS policies.</strong> The policy uses the two-arg form of <code>current_setting</code>, which returns <code>NULL</code> when the GUC is unset rather than raising:
+    <pre><code>CREATE POLICY tenant_isolation ON verification_jobs
+  USING (org_id = current_setting('app.current_org_id', true)::uuid);</code></pre>
+    <code>org_id = NULL</code> evaluates to <code>NULL</code>, which is not true, so no rows match. Forgetting to <code>SET LOCAL</code> doesn't leak data — the query returns empty.</li>
+  <li><strong>Single sanctioned session factory.</strong> Route handlers receive sessions only via a FastAPI dependency, <code>get_scoped_session(org_id)</code>, which always sets the GUC inside a transaction. The underlying SQLAlchemy engine is module-private. Anyone wanting a raw connection has to go out of their way, which surfaces in code review.</li>
+  <li><strong>A regression test.</strong> Connect as <code>app_api</code> with no GUC set, run <code>SELECT * FROM verification_jobs</code>, assert zero rows. RLS failing closed is silent — without this test, a future refactor that forgets to set the GUC would be caught by a customer complaint, not by CI.</li>
+</ol>
+
+<h3>Why not just discipline + a repository pattern?</h3>
+
+<p>It works, until it doesn't. A junior engineer adds an admin query that forgets the scope, or a join introduces a row from an unscoped table, or a raw SQL migration touches the wrong rows. Tenant-leak bugs are catastrophic and impossible to retract. The cost of RLS is ~50 lines of policy SQL; the benefit is that the guarantee is enforced at the layer that actually controls the data.</p>
+
+<h2 id="fairness">4. Fairness: longest-waited org wins</h2>
+
+<p>The fairness rule: <strong>the org whose pending jobs have waited the longest gets the next dispatch slot.</strong> Concretely, I track <code>last_served_at</code> on each org (initially <code>NULL</code>), and the claim query selects the next job belonging to the org with the smallest <code>last_served_at</code> that still has eligible pending work.</p>
+
+<pre><code>WITH next_org AS (
+  SELECT o.id
+  FROM organizations o
+  WHERE EXISTS (
+    SELECT 1 FROM verification_jobs j
+    WHERE j.org_id = o.id
+      AND j.status = 'pending'
+      AND j.next_attempt_at &lt;= now()
+  )
+  ORDER BY o.last_served_at NULLS FIRST
+  LIMIT 1
+),
+claimed AS (
+  SELECT j.id
+  FROM verification_jobs j, next_org
+  WHERE j.org_id = next_org.id
+    AND j.status = 'pending'
+    AND j.next_attempt_at &lt;= now()
+  ORDER BY j.created_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE verification_jobs
+SET status = 'in_progress', claimed_at = now(), attempts = attempts + 1
+WHERE id IN (SELECT id FROM claimed)
+RETURNING *;
+</code></pre>
+
+<p>After a successful claim, the worker bumps <code>organizations.last_served_at = now()</code> for that org. The org rotates to the back of the line.</p>
+
+<p>This is essentially round-robin across orgs with pending work, weighted by recency of service. With one org pushing 10k jobs and another org with one job, the second org's job is dispatched on the very next tick after the first org's most recent dispatch — it doesn't queue behind the other 9,999.</p>
+
+<p><strong>Why not weighted fair queueing (deficit round-robin)?</strong> WFQ adds value when orgs have different priorities or quotas. For "no one starves," simple longest-waited-first is sufficient and explainable in one paragraph. WFQ would be the next step if Tofu introduces per-org SLAs.</p>
+
+<h2 id="ratelimit">5. Rate limiting via token bucket</h2>
+
+<p>A single in-process token bucket controls dispatch: capacity 10, refill rate 10/sec. The worker loop is:</p>
+
+<pre><code>while True:
+    job = claim_next_job()           # fairness query, see §4
+    if job is None:
+        await asyncio.sleep(0.2)     # idle backoff
+        continue
+    await bucket.acquire()           # blocks until a token is available
+    asyncio.create_task(process(job))
+</code></pre>
+
+<p>One mechanism, one knob. The bucket handles steady-state pacing (sustained 10 r/s), absorbs short idle periods (up to 10 tokens of headroom), and naturally smooths out clock jitter without needing a tick scheduler. Under a 1000-job backlog, the worker fires the first 10 immediately (the bucket is full from idle), then settles to exactly 10/sec — which is the ceiling, not over it. No thundering herd.</p>
+
+<p>The bucket itself is ~20 lines: a <code>tokens</code> counter, a <code>last_refill</code> timestamp, and an <code>acquire()</code> that refills lazily and sleeps if the bucket is empty. Asyncio-friendly, no shared-memory locking needed for single-worker.</p>
+
+<p><strong>Belt-and-suspenders enforcement.</strong> The enrichment service enforces the 10 r/s ceiling on its end too. If the dispatcher ever exceeds it (clock skew, a bug, a reclaim flood), the provider returns 429 and we back off. The rate-limit guarantee doesn't rest on the dispatcher being bug-free.</p>
+
+<p>For multi-worker (production), the bucket moves to Redis with an atomic Lua refill+decrement script — same algorithm, same knobs, just shared state. See <a href="#prod">§10</a>.</p>
+
+<h2 id="retries">6. Retries &amp; backoff</h2>
+
+<p>Each job has an <code>attempts</code> counter and a <code>next_attempt_at</code> timestamp. On transient failure (5xx, 429, network error, timeout):</p>
+
+<ul>
+  <li>Set <code>status = 'pending'</code> (back in the queue).</li>
+  <li>Bump <code>attempts</code>.</li>
+  <li>Set <code>next_attempt_at = now() + 2^(attempts-1) seconds</code>. So: 1s, 2s, 4s, 8s, 16s.</li>
+  <li>After 5 attempts, terminal <code>failed</code> state with the last error captured in <code>result</code>.</li>
+</ul>
+
+<p>Non-retryable failures (4xx other than 429) skip retries and go directly to <code>failed</code>. Backoff uses simple exponential without jitter for the demo; production should add jitter to avoid thundering herd after a provider outage (see <a href="#prod">§10</a>).</p>
+
+<p>The claim query naturally respects backoff by filtering <code>next_attempt_at &lt;= now()</code>, so retries don't need a separate scheduler.</p>
+
+<h2 id="crash">7. Crash recovery</h2>
+
+<p>A second asyncio loop runs once per second in the worker process:</p>
+
+<pre><code>UPDATE verification_jobs
+SET status = 'pending', claimed_at = NULL
+WHERE status = 'in_progress'
+  AND claimed_at &lt; now() - interval '60 seconds';
+</code></pre>
+
+<p>Any job claimed more than 60s ago is presumed orphaned (provider takes ≤5s; 60s is comfortably outside any healthy path) and pushed back to pending. The next dispatcher tick will pick it up. <code>attempts</code> is <em>not</em> incremented on reclaim — the original increment already happened at claim time, so a reclaimed job has already "used" one of its attempts.</p>
+
+<p>This is a visibility-timeout pattern, implemented in Postgres. No separate broker, no lease renewals. The full design moves this to per-row leases held by named workers — see <a href="#prod">§10</a>.</p>
+
+<h3>Idempotency at the provider boundary</h3>
+
+<p>If the worker crashes <em>after</em> the provider has done the work but <em>before</em> we wrote the result, the reclaim will re-dispatch and the provider will do the work again. In production, this is solved with an idempotency key per attempt — the provider deduplicates. For the demo, I'm calling this out and accepting at-least-once semantics. Stubbed, not solved.</p>
+
+<h2 id="data">8. Data model</h2>
+
+<table>
+<thead><tr><th>Table</th><th>Columns</th><th>Notes</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>organizations</code></td>
+  <td><code>id (uuid pk)</code>, <code>name</code>, <code>last_served_at</code></td>
+  <td>Tenant metadata. Seeded with two orgs at boot. <code>last_served_at</code> drives fairness.</td>
+</tr>
+<tr>
+  <td><code>api_keys</code></td>
+  <td><code>id (uuid pk)</code>, <code>org_id (fk)</code>, <code>key_hash (unique)</code>, <code>label</code>, <code>created_at</code></td>
+  <td>Auth table. No RLS — lookup is by <code>key_hash</code>, which <em>is</em> the credential. One org → many keys (rotation, scopes, expiry slot in here later).</td>
+</tr>
+<tr>
+  <td><code>verification_jobs</code></td>
+  <td><code>id (uuid pk)</code>, <code>org_id (fk)</code>, <code>subject_email</code>, <code>metadata jsonb</code>, <code>status</code>, <code>attempts</code>, <code>next_attempt_at</code>, <code>claimed_at</code>, <code>result jsonb</code>, <code>created_at</code>, <code>updated_at</code></td>
+  <td>RLS-protected. <code>status ∈ {pending, in_progress, completed, failed}</code>.</td>
+</tr>
+</tbody>
+</table>
+
+<p><strong>Indexes:</strong></p>
+
+<ul>
+  <li><code>(org_id, id DESC)</code> for paginated listing.</li>
+  <li><code>(status, next_attempt_at)</code> partial index <code>WHERE status = 'pending'</code> — the dispatcher's hot path.</li>
+  <li><code>(status, claimed_at)</code> partial index <code>WHERE status = 'in_progress'</code> — for the reclaim loop.</li>
+</ul>
+
+<h2 id="api">9. API surface</h2>
+
+<table>
+<thead><tr><th>Method</th><th>Path</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td>POST</td><td><code>/verifications</code></td><td>Body <code>{ subject_email, metadata? }</code>. Inserts a pending job. Returns <code>{ id, status: 'pending', created_at }</code> immediately.</td></tr>
+<tr><td>GET</td><td><code>/verifications/:id</code></td><td>Returns the job. 404 if not found <em>or</em> not owned by this org — we never leak existence.</td></tr>
+<tr><td>GET</td><td><code>/verifications</code></td><td>Page-based: <code>?page=1&amp;page_size=50</code>. Returns <code>{ items, page, page_size, total }</code>. RLS keeps each org in their own slice.</td></tr>
+</tbody>
+</table>
+
+<p><strong>Auth.</strong> <code>X-API-Key</code> header. Missing or unknown → 401. Implemented as a FastAPI dependency that opens the transaction, sets the RLS GUC, and yields a scoped session to the route handler.</p>
+
+<h2 id="prod">10. Full production design (bells &amp; whistles)</h2>
+
+<p>If this were the real system, the additions over the vertical slice would be:</p>
+
+<table>
+<thead><tr><th>Concern</th><th>Production approach</th></tr></thead>
+<tbody>
+<tr>
+  <td>Multi-worker dispatch</td>
+  <td>Multiple worker pods. Global rate limit becomes a Redis token bucket (atomic Lua script: decrement-if-positive). Fairness query is unchanged. Each worker takes ≤1 token per loop iteration, then claims one job. Workers identify themselves with a UUID and write <code>claimed_by</code> on the row.</td>
+</tr>
+<tr>
+  <td>Lease renewal</td>
+  <td>Long-running jobs renew their lease (<code>UPDATE … SET claimed_at = now() WHERE claimed_by = $me</code>) every N seconds. Reclaim threshold drops from 60s to ~3× renewal interval. Distinguishes "worker is dead" from "job is slow."</td>
+</tr>
+<tr>
+  <td>Idempotency</td>
+  <td>Per-attempt idempotency key sent to provider. Provider dedupes within a window. Eliminates duplicate-work risk under at-least-once delivery.</td>
+</tr>
+<tr>
+  <td>Dead-letter handling</td>
+  <td>Jobs that exhaust retries land in a DLQ view with one-click replay. On-call has a runbook for triaging.</td>
+</tr>
+<tr>
+  <td>Per-org quotas &amp; submission rate limits</td>
+  <td>Back-pressure at <code>POST /verifications</code>: <code>429</code> when an org's pending queue exceeds its quota. Prevents one org from chewing the global ceiling for hours.</td>
+</tr>
+<tr>
+  <td>Webhooks / async callbacks</td>
+  <td>On terminal state, POST to a customer-configured URL with HMAC signature and retry-with-backoff. Customers stop polling.</td>
+</tr>
+<tr>
+  <td>Observability</td>
+  <td>Prometheus metrics (queue depth per org, dispatch rate, retry rate, p50/p95/p99 end-to-end). OTel traces from API → DB → worker → provider. Structured JSON logs with <code>org_id</code>, <code>job_id</code>, <code>attempt</code> on every event.</td>
+</tr>
+<tr>
+  <td>Provider abstraction</td>
+  <td>Wrap the provider call behind an interface. Multiple providers behind a strategy (cost, latency, fallback). Circuit breaker per provider.</td>
+</tr>
+<tr>
+  <td>API key lifecycle</td>
+  <td>Keys have an id, label, created_at, expires_at, revoked_at, scope. Rotation supported via overlapping validity. Audit log on every authenticated call.</td>
+</tr>
+<tr>
+  <td>Backoff jitter</td>
+  <td>Add full jitter to exponential backoff. Prevents synchronized retry storms after a provider outage.</td>
+</tr>
+<tr>
+  <td>Schema for <code>metadata</code></td>
+  <td>Today it's freeform JSONB. In production, customers register a schema and we validate on submit.</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="cuts">11. Vertical slice: implemented vs cut</h2>
+
+<p>The implementation focuses on the four mechanisms that make this problem interesting. Everything else is stubbed honestly.</p>
+
+<h3>Implemented</h3>
+
+<ul>
+  <li><span class="tag impl">Built</span> Postgres RLS for tenant isolation, with credentials kept in a separate <code>api_keys</code> auth table so the lookup is unscoped and clean, and a privileged <code>app_worker</code> role with <code>BYPASSRLS</code> for the dispatcher.</li>
+  <li><span class="tag impl">Built</span> Defense-in-depth around RLS: two Postgres roles (<code>app_api</code> / <code>app_worker</code>) with different grants, fail-closed policies via two-arg <code>current_setting</code>, single sanctioned session factory, and a regression test that asserts zero rows leak without the GUC.</li>
+  <li><span class="tag impl">Built</span> Fairness scheduler: longest-waited-org-wins via <code>organizations.last_served_at</code>.</li>
+  <li><span class="tag impl">Built</span> In-process token bucket (capacity 10, refill 10/sec) controlling the dispatcher. Single mechanism handles steady-state pacing, idle headroom, and natural smoothing.</li>
+  <li><span class="tag impl">Built</span> Retries with exponential backoff (1, 2, 4, 8, 16s), max 5 attempts.</li>
+  <li><span class="tag impl">Built</span> Crash recovery via reclaim loop with 60s visibility timeout. Verified end-to-end by killing the worker mid-job and watching the reclaimer return the orphan on restart.</li>
+  <li><span class="tag impl">Built</span> All three endpoints (submit, get, list-paginated) with API key auth.</li>
+  <li><span class="tag impl">Built</span> A real separate <code>enrichment</code> service that enforces its own 10 r/s ceiling, so compliance is observable, not assumed.</li>
+  <li><span class="tag impl">Built</span> A <code>scripts/load.py</code> harness that submits skewed load (e.g. 30 jobs from Org A, 1 from Org B) and prints a per-org summary using <code>job.updated_at − job.created_at</code> so the fairness signal is honest.</li>
+  <li><span class="tag impl">Built</span> Four test files (eight tests total): isolation (cross-org read is 404 + list scoping + auth 401s), RLS fail-closed (no GUC → zero rows, plus the positive case), fairness (Org B's lone job isn't blocked behind Org A's backlog), retry (5xx storm increments attempts and respects backoff).</li>
+</ul>
+
+<h3>Cut, with rationale</h3>
+
+<ul>
+  <li><span class="tag cut">Cut</span> <strong>Multi-worker dispatch.</strong> A single worker is sufficient for 10 r/s, and the design is honest about where the Redis token bucket would slot in. Building multi-worker correctly in 4 hours would consume the whole budget.</li>
+  <li><span class="tag cut">Cut</span> <strong>Idempotency keys at the provider boundary.</strong> Documented as at-least-once. Solving it properly requires provider cooperation, which the stub provider doesn't model.</li>
+  <li><span class="tag cut">Cut</span> <strong>API key lifecycle (rotation, scopes, expiry).</strong> Two keys seeded at boot, sha256-hashed. Sufficient for the demo.</li>
+  <li><span class="tag cut">Cut</span> <strong>Webhooks.</strong> Polling is fine for the demo.</li>
+  <li><span class="tag cut">Cut</span> <strong>Metrics &amp; tracing.</strong> Structured JSON logs on every worker event give the reviewer everything needed to see fairness, rate limiting, and retries in action via <code>docker compose logs -f worker</code>. Prometheus/OTel is the next step.</li>
+  <li><span class="tag cut">Cut</span> <strong>Dead-letter view, replay, per-org quotas, jitter, provider circuit breaker, metadata schema validation.</strong> Listed above in §10.</li>
+</ul>
+
+<hr/>
+
+<p class="small">Repo layout, run instructions, and tests live in <code>README.md</code>. This document is intentionally separate so the design is reviewable independent of the code.</p>
+
+</body>
+</html>

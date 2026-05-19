@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: verifications
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d verifications"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+
+  enrichment:
+    build: ./enrichment
+    ports:
+      - "8081:8080"
+    environment:
+      RATE_LIMIT_PER_SEC: "10"
+      FAILURE_RATE: "0.20"
+      MIN_LATENCY_MS: "1000"
+      MAX_LATENCY_MS: "5000"
+
+  api:
+    build: ./api
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app_api:app_api_pw@postgres:5432/verifications
+      LOG_LEVEL: INFO
+
+  worker:
+    build: ./worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      enrichment:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app_worker:app_worker_pw@postgres:5432/verifications
+      ENRICHMENT_URL: http://enrichment:8080
+      RATE_LIMIT_PER_SEC: "10"
+      RATE_LIMIT_BURST: "10"
+      MAX_ATTEMPTS: "5"
+      RECLAIM_AFTER_SECONDS: "60"
+      LOG_LEVEL: INFO

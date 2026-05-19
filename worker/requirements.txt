@@ -1,0 +1,3 @@
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+httpx==0.27.2
