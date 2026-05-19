@@ -5,8 +5,9 @@ submit verification requests, and a worker drains them against a flaky
 third-party provider at a strict 10 req/s — fairly across orgs, with
 crash-safe state in Postgres and tenant isolation enforced at the row level.
 
-See [`DESIGN.html`](./DESIGN.html) for the architecture and the explicit
-list of what was implemented vs. cut.
+See [`DESIGN.md`](./DESIGN.md) (renders on GitHub) or
+[`DESIGN.html`](./DESIGN.html) (open in a browser) for the architecture
+and the explicit list of what was implemented vs. cut.
 
 ## Quickstart
 
@@ -152,4 +153,4 @@ docker compose down -v && docker compose up --build
 ---
 
 _Built as a 3–4 hour take-home exercise; the scope cuts are listed in
-[`DESIGN.html`](./DESIGN.html) §11._
+[`DESIGN.md`](./DESIGN.md) §11._
